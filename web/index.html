@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>漂移法赤道仪校准推演台</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>漂移法赤道仪校准推演台</h1>
+  <div class="sess-bar">
+    <select id="sessionSelect" title="恢复会话"></select>
+    <button id="newSessionBtn" type="button">新建会话</button>
+    <button id="exportBtn" type="button">导出 JSON</button>
+    <label class="file-btn">导入 JSON<input id="importFile" type="file" accept="application/json,.json" hidden></label>
+    <button id="printBtn" type="button">打印校准单</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左栏：设置与观测 -->
+  <section class="col col-left">
+    <div class="card" id="settingsCard">
+      <h2>① 观测设置</h2>
+      <div class="form-grid">
+        <label>南北半球
+          <select id="hemisphere">
+            <option value="N">北半球（对准北天极）</option>
+            <option value="S">南半球（对准南天极）</option>
+          </select>
+        </label>
+        <label>赤道仪类型
+          <select id="mountType">
+            <option value="GEM">德式赤道仪 GEM（有换向）</option>
+            <option value="fork">叉式 / 伸缩锤式（无换向）</option>
+          </select>
+        </label>
+        <label>观测者纬度 φ（选填，度）
+          <input id="latitude" type="number" step="0.0001" min="-90" max="90"
+                 placeholder="如 39.9，留空则只做经验判读">
+        </label>
+        <label>目标方位角 A（北=0°，向东递增）
+          <input id="azimuth" type="number" step="0.1" min="0" max="360" placeholder="如 180">
+        </label>
+        <label>目标高度角 h（度）
+          <input id="altitude" type="number" step="0.1" min="1" max="90" placeholder="如 50">
+        </label>
+        <label>目标赤纬 δ（度，选填）
+          <input id="declination" type="number" step="0.1" min="-90" max="90"
+                 placeholder="-90～+90，用于适宜性判断">
+        </label>
+        <label>目镜/相机翻转
+          <select id="flip">
+            <option value="none">无翻转（直焦相机）</option>
+            <option value="diag" selected>天顶镜（上下翻转）</option>
+            <option value="mirror">牛顿反射（左右翻转）</option>
+            <option value="rotate180">天顶镜+反射（旋转180°）</option>
+            <option value="custom">自定义旋转角…</option>
+          </select>
+        </label>
+        <label>自定义视场旋转角（度，仅自定义时）
+          <input id="customRot" type="number" step="1" min="0" max="360" value="0" disabled>
+        </label>
+        <label class="span2">刻度增大方向在真实天空中指向
+          <select id="scaleDir">
+            <option value="N">北（赤纬增大）</option>
+            <option value="S">南（赤纬减小）</option>
+          </select>
+        </label>
+        <div class="preset-row span2" id="scalePresets"></div>
+        <label>角尺度：每格/每像素角秒（选填）
+          <input id="arcsecPerTick" type="number" step="0.01" min="0"
+                 placeholder="留空 = 只给调整方向，不估算量">
+        </label>
+      </div>
+      <p class="hint" id="geometryHint"></p>
+    </div>
+
+    <div class="card" id="observeCard">
+      <h2>② 观测打点</h2>
+      <div class="seg-bar">
+        <label>当前测段
+          <select id="segKind">
+            <option value="meridian">子午线段（过子午线，高位）</option>
+            <option value="east_low">东低空段（东升星）</option>
+            <option value="west_low">西低空段（西落星）</option>
+          </select>
+        </label>
+        <button id="newRoundBtn" type="button">开始新轮次</button>
+      </div>
+      <div class="round-line">
+        <span id="roundLabel">尚未开始轮次</span>
+        <button id="lockSegBtn" type="button" class="ghost">锁定当前测段</button>
+        <button id="clearPtsBtn" type="button" class="ghost danger">清空本测段打点</button>
+      </div>
+
+      <div class="tick-entry">
+        <label>刻度位置 <input id="tickInput" type="number" step="any" placeholder="打点时可留空"></label>
+        <label>越过方向
+          <select id="dirInput">
+            <option value="1">刻度增大方向（+）</option>
+            <option value="-1">刻度减小方向（−）</option>
+          </select>
+        </label>
+        <button id="markBtn" type="button" class="big">打点 <kbd>空格</kbd></button>
+        <button id="undoBtn" type="button" class="ghost">撤销 <kbd>U</kbd></button>
+      </div>
+      <p class="hint">
+        热键：<b>空格</b> 恒星越过十字线瞬间打点；<b>U</b> 撤销最后一点；
+        <b>M / E / W</b> 切换子午线 / 东低空 / 西低空测段；<b>L</b> 锁定测段。
+        打点时把此刻度读数一并录入即可，也可事后在表格里修改、排除单点。
+      </p>
+      <table class="pts-table" id="ptsTable">
+        <thead><tr><th>#</th><th>时刻</th><th>刻度</th><th>方向</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 中栏：轨迹与视场 -->
+  <section class="col col-center">
+    <div class="card">
+      <h2>③ 漂移轨迹（赤纬方向，<span id="driftUnit">刻度</span>）</h2>
+      <svg id="chart" viewBox="0 0 640 300" role="img" aria-label="漂移轨迹图"></svg>
+      <div class="legend" id="chartLegend"></div>
+    </div>
+    <div class="card">
+      <h2>视场示意（十字线与方向）</h2>
+      <svg id="fov" viewBox="0 0 300 300" role="img" aria-label="视场方向示意"></svg>
+      <p class="hint" id="fovHint">N 标记代表真实北天方向；红色箭头代表当前漂移方向（按你的翻转设置映射到目镜/相机画面）。</p>
+    </div>
+  </section>
+
+  <!-- 右栏：解算与建议 -->
+  <section class="col col-right">
+    <div class="card" id="analysisCard">
+      <h2>④ 解算与调整建议</h2>
+      <div id="segResults"></div>
+      <div id="adviceBox"></div>
+    </div>
+    <div class="card" id="roundsCard">
+      <h2>⑤ 逐轮比较</h2>
+      <table class="rounds-table" id="roundsTable">
+        <thead><tr><th>轮次</th><th>方位轴残余</th><th>高度轴残余</th><th>记录的调整</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="adj-record">
+        <label>本轮实际调整：方位轴
+          <input id="adjAz" type="text" placeholder="如 向东拧 1/8 圈">
+        </label>
+        <label>高度轴
+          <input id="adjAlt" type="text" placeholder="如 仰角升高 2 格">
+        </label>
+        <button id="saveAdjBtn" type="button">保存本轮调整记录</button>
+      </div>
+      <div id="contradictionBox"></div>
+    </div>
+  </section>
+</main>
+
+<!-- 打印用校准单 -->
+<section id="printSheet" hidden>
+  <h1>漂移法赤道仪现场校准单</h1>
+  <div id="printContent"></div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
