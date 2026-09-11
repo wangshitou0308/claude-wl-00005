@@ -128,16 +128,22 @@ function applySettings(s) {
 }
 
 let saveTimer = null;
-function scheduleSaveSettings() {
-  if (!state.bundle) return;
+function localSettingsChanged() {
+  // 先同步到本地状态并立即重算（几何/角尺度/翻转的变化马上反映到图表与结论）
+  if (state.bundle) {
+    state.bundle.settings = readSettings();
+    renderAll();
+  } else {
+    renderGeometryHint();
+  }
   clearTimeout(saveTimer);
+  if (!state.bundle) return;
+  const snapshot = state.bundle.settings;
   saveTimer = setTimeout(async () => {
     try {
-      state.bundle.settings = readSettings();
-      await api("PATCH", `/api/sessions/${state.bundle.id}`, { settings: state.bundle.settings });
-      await refreshBundle(false);
+      await api("PATCH", `/api/sessions/${state.bundle.id}`, { settings: snapshot });
     } catch (e) { alert("设置保存失败：" + e.message); }
-  }, 250);
+  }, 300);
 }
 
 /* ---------------- 会话/轮次/测段导航 ---------------- */
@@ -209,6 +215,22 @@ function findSegment(round, kind) {
     (a, b2) => a.created_at - b2.created_at).slice(-1)[0] || null;
 }
 
+// 写入测段快照的字段：这些是“目标在天空中的位置”，随测段固定
+const GEO_KEYS = ["hemisphere", "mountType", "latitude", "azimuth", "altitude", "declination"];
+function geoSnapshot(s) {
+  s = s || readSettings();
+  const out = {};
+  for (const k of GEO_KEYS) out[k] = s[k];
+  return out;
+}
+// 测段生效设置 = 会话级测量变换（翻转/刻度方向/角尺度）+ 该测段自己的几何快照
+function segmentSettings(seg, s) {
+  const merged = { ...s };
+  const snap = (seg && seg.snapshot) || {};
+  for (const k of GEO_KEYS) if (snap[k] !== undefined && snap[k] !== null) merged[k] = snap[k];
+  return merged;
+}
+
 async function ensureRoundAndSegment(kind) {
   if (!state.bundle) await createSession();
   let round = currentRound();
@@ -218,7 +240,8 @@ async function ensureRoundAndSegment(kind) {
   }
   let seg = findSegment(round, kind);
   if (!seg) {
-    const g = await api("POST", `/api/rounds/${round.id}/segments`, { kind });
+    const g = await api("POST", `/api/rounds/${round.id}/segments`,
+      { kind, snapshot: geoSnapshot() });
     await refreshBundle(false);
     round = currentRound();
     seg = round.segments.find((x) => x.id === g.id);
@@ -235,6 +258,10 @@ async function markPoint() {
     const kind = $("segKind").value;
     state.segKind = kind;
     const seg = await ensureRoundAndSegment(kind);
+    // 测段尚无点时，允许用表单里最新的位置修正本段几何；一旦有点，快照即冻结
+    if (!seg.points.length) {
+      await api("PATCH", `/api/segments/${seg.id}`, { snapshot: geoSnapshot() });
+    }
     const raw = $("tickInput").value;
     const tick = raw === "" ? 0 : +raw;
     await api("POST", `/api/segments/${seg.id}/points`, {
@@ -281,33 +308,47 @@ function currentSegment() {
 
 /* ---------------- 单测段分析 ---------------- */
 
-function analyzeSegment(seg, settings) {
+function analyzeSegment(seg, sessionSettings) {
+  // 会话级测量变换（角尺度/翻转/刻度方向）实时生效；几何取测段快照
+  const settings = segmentSettings(seg, sessionSettings);
   const out = {
-    seg, warnings: [], refusals: [], good: [],
+    seg, settings, warnings: [], refusals: [], good: [],
     n: 0, duration_s: 0, fit: null,
-    slope_tick_min: null, slope_as_s: null, se_as_s: null,
-    decRate_as_s: null, geo: null, outlierIdx: new Set(),
-    usable: false, quantifiable: false,
+    slope_tick_min: null, slope_as_s: null, se_as_s: null, se_tick_min: null,
+    decRate_as_s: null, decSign: null, geo: null, outlierIdx: new Set(),
+    geomOk: false, directionUsable: false, usable: false, quantifiable: false,
+    snapshotMismatch: false,
   };
   const pts = seg.points.filter((p) => !p.excluded);
   out.n = pts.length;
   if (pts.length >= 2)
     out.duration_s = (pts[pts.length - 1].t - pts[0].t) / 1000;
 
-  // 几何
+  // 表单当前几何与测段快照不一致时提示（旧测段不被新位置污染）
+  if (seg.points.length && seg.snapshot && sessionSettings) {
+    for (const k of ["hemisphere", "azimuth", "altitude", "latitude"]) {
+      const a = sessionSettings[k], b = seg.snapshot[k];
+      if (a !== null && a !== undefined && b !== null && b !== undefined &&
+          (k === "hemisphere" ? a !== b : Math.abs((a || 0) - (b || 0)) > 1e-9)) {
+        out.snapshotMismatch = true; break;
+      }
+    }
+  }
+
+  // —— 几何适宜性（用测段快照）——
   if (settings.azimuth === null || settings.altitude === null) {
-    out.refusals.push("尚未填写目标方位角/高度角，无法把漂移换算到赤纬方向。");
+    out.refusals.push("该测段缺少目标方位角/高度角，无法把漂移换算到赤纬方向。");
   } else {
     const phi = settings.hemisphere === "S"
       ? -(settings.latitude ?? 0) : (settings.latitude ?? 0);
     const g = Calc.hdOf(phi, settings.azimuth, settings.altitude);
     out.geo = g;
+    out.geomOk = true;
     const Hdeg = g.H * 180 / Math.PI, decdeg = g.dec * 180 / Math.PI;
 
-    // 目标位置适宜性
-    if (settings.altitude < 15) out.refusals.push(`目标高度仅 ${settings.altitude}°，大气折射严重，定量结果不可信。`);
-    else if (settings.altitude < 20) out.warnings.push(`高度 ${settings.altitude}° 偏低，折射修正不确定，建议 >25°。`);
-    if (Math.abs(decdeg) > 72) out.warnings.push(`目标赤纬 |δ|≈${Math.abs(decdeg).toFixed(0)}° 靠近天极，周日运动慢，不灵敏。`);
+    if (settings.altitude < 10) out.refusals.push(`目标高度仅 ${settings.altitude}°，大气折射严重，结果不可信。`);
+    else if (settings.altitude < 20) out.warnings.push(`高度 ${settings.altitude}° 偏低，折射不确定，建议 >25°。`);
+    if (Math.abs(decdeg) > 72) out.warnings.push(`目标赤纬 |δ|≈${Math.abs(decdeg).toFixed(0)}° 靠近天极，周日运动慢、不灵敏。`);
     if (settings.declination !== null && Math.abs(settings.declination - decdeg) > 3)
       out.warnings.push(`填写的赤纬 ${settings.declination}° 与由方位/高度推算的 δ=${decdeg.toFixed(1)}° 不一致，请核对。`);
 
@@ -320,17 +361,13 @@ function analyzeSegment(seg, settings) {
       if (settings.altitude > 45) out.warnings.push(`${KIND_LABEL[seg.kind]}目标高度 ${settings.altitude}° 偏高，典型漂移法低空段取 15–40°。`);
       if (sinAbs < 0.45) out.refusals.push(`|sin H|=${sinAbs.toFixed(2)} 太小，高度轴几乎不产生可测漂移，请用更靠近东/西点的星。`);
       else if (sinAbs < 0.7) out.warnings.push(`|sin H|=${sinAbs.toFixed(2)}，高度轴灵敏度一般。`);
-      const expectEast = Hdeg < 0, expectWest = Hdeg > 0;
-      if (seg.kind === "east_low" && !expectEast)
+      if (seg.kind === "east_low" && Hdeg > 0)
         out.warnings.push("时角 H>0（星在子午线以西），与“东低空段”标注不符。");
-      if (seg.kind === "west_low" && !expectWest)
+      if (seg.kind === "west_low" && Hdeg < 0)
         out.warnings.push("时角 H<0（星在子午线以东），与“西低空段”标注不符。");
     }
-    if (settings.mountType === "GEM" && seg.kind === "meridian" &&
-        pts.some((p) => false) === false && out.duration_s > 0) {
-      // 仅提示风险，不阻断
-      out.good.push("注意德式赤道仪中天附近可能需要翻转，翻转前后数据不要并入同一直线。");
-    }
+    if (settings.mountType === "GEM" && seg.kind === "meridian")
+      out.good.push("德式赤道仪中天附近可能需要翻转，翻转前后的数据不要并入同一直线。");
   }
 
   if (out.n < 2) {
@@ -341,25 +378,25 @@ function analyzeSegment(seg, settings) {
   const fit = Calc.linfit(pts);
   out.fit = fit;
   out.slope_tick_min = fit.b * 60000;                 // 刻度/分钟
-  const dirSign = settings.scaleDir === "S" ? -1 : +1; // 刻度增大端指向
-  const s = settings.arcsecPerTick;
-  if (s !== null && s > 0) {
-    out.slope_as_s = fit.b * 1000 * s;                // 角秒/秒（沿刻度增大方向）
-    out.se_as_s = fit.se_b * 1000 * s;
+  out.se_tick_min = fit.se_b * 60000;
+  const dirSign = settings.scaleDir === "S" ? -1 : +1; // 刻度增大端指向真实南/北
+  const sc = settings.arcsecPerTick;
+  if (sc !== null && sc > 0) {
+    out.slope_as_s = fit.b * 1000 * sc;               // 角秒/秒（沿刻度增大方向）
+    out.se_as_s = fit.se_b * 1000 * sc;
     out.decRate_as_s = out.slope_as_s * dirSign;      // 赤纬方向：正=向北
   }
+  // 没有角尺度也给出赤纬漂移的符号（刻度斜率 × 刻度端指向）
+  out.decSign = out.slope_tick_min === 0 ? 0 : Math.sign(out.slope_tick_min * dirSign);
 
-  // 时长 / 点数
-  if (out.duration_s < 20) out.refusals.push(`测段仅 ${out.duration_s.toFixed(0)} 秒，时长不足，不能定量。`);
+  if (out.duration_s < 15) out.refusals.push(`测段仅 ${out.duration_s.toFixed(0)} 秒，时长不足。`);
   else if (out.duration_s < 45) out.warnings.push(`测段 ${out.duration_s.toFixed(0)} 秒偏短，建议 ≥60 秒。`);
   if (out.n < 4) out.warnings.push(`仅 ${out.n} 点，建议 4 点以上以便识别异常点。`);
 
-  // 越过方向一致性（回程间隙线索）
   const dirs = new Set(pts.map((p) => p.direction));
   if (dirs.size > 1)
-    out.warnings.push("同一测段出现两个越过方向：可能碰到了赤纬微动、存在回程间隙或混入了不同穿越。");
+    out.warnings.push("同一测段出现两个越过方向：可能碰到赤纬微动、存在回程间隙或混入了不同穿越。");
 
-  // 前后两半斜率反转（中途调整/间隙）
   if (out.n >= 4) {
     const half = Math.floor(out.n / 2);
     const f1 = Calc.linfit(pts.slice(0, half + 1));
@@ -368,7 +405,6 @@ function analyzeSegment(seg, settings) {
       out.warnings.push("测段前后半斜率符号相反：疑似中途拧过调节钮、回程间隙或记录中断。");
   }
 
-  // 异常点：MAD 残差
   if (out.n >= 5) {
     const absr = fit.resid.map(Math.abs).sort((x, y) => x - y);
     const mad = absr[Math.floor(absr.length / 2)] || 0;
@@ -382,100 +418,136 @@ function analyzeSegment(seg, settings) {
     }
   }
 
-  out.usable = out.refusals.length === 0;
-  out.quantifiable = out.usable && out.decRate_as_s !== null &&
-    settings.latitude !== null && out.duration_s >= 20;
-  if (out.usable) out.good.push(`拟合斜率 ${out.slope_tick_min >= 0 ? "+" : ""}${out.slope_tick_min.toFixed(3)} 格/分，${
-    out.decRate_as_s === null ? "未填角尺度，仅判断方向。" :
-    `赤纬漂移 ${out.decRate_as_s >= 0 ? "向北" : "向南"} ${Math.abs(out.decRate_as_s).toFixed(4)} 角秒/秒。`}`);
+  // 方向是否可信：几何通过、时长够、斜率相对其不确定度显著
+  const slopeMag = Math.abs(out.slope_tick_min);
+  const slopeSig = out.n < 3 || slopeMag > 1.5 * Math.abs(out.se_tick_min);
+  if (!slopeSig)
+    out.warnings.push("斜率与拟合噪声相当，漂移方向尚不能确定，建议延长观测或加打点。");
+  out.directionUsable = out.geomOk && out.duration_s >= 15 && out.decSign !== 0 && slopeSig;
+
+  out.usable = out.directionUsable && out.refusals.length === 0;
+  out.quantifiable = out.usable && out.decRate_as_s !== null && settings.latitude !== null;
+
+  const dirTxt = out.decSign > 0 ? "向北" : "向南";
+  const rateTxt = out.decRate_as_s === null
+    ? "未填角尺度，仅给出漂移方向。"
+    : `赤纬漂移${dirTxt} ${Math.abs(out.decRate_as_s).toFixed(4)} 角秒/秒。`;
+  if (out.usable)
+    out.good.push(`拟合斜率 ${out.slope_tick_min >= 0 ? "+" : ""}${out.slope_tick_min.toFixed(3)} 格/分；${rateTxt}`);
   return out;
 }
 
 /* ---------------- 轮次级联立解算 ---------------- */
 
-function analyzeRound(round, settings) {
-  const segs = round.segments.map((g) => analyzeSegment(g, settings));
-  // 锁定优先：同种类若有锁定段，只用锁定段
+function analyzeRound(round, sessionSettings) {
+  const segs = round.segments.map((g) => analyzeSegment(g, sessionSettings));
+  // 锁定优先；数值段优先于仅方向段
   const pick = (kind) => {
-    const all = segs.filter((x) => x.seg.kind === kind && x.usable && x.decRate_as_s !== null);
-    const locked = all.filter((x) => x.seg.locked);
-    return (locked.length ? locked : all).sort((a, b) => b.n - a.n)[0] || null;
+    const cand = segs.filter((x) => x.seg.kind === kind && x.usable);
+    const locked = cand.filter((x) => x.seg.locked);
+    const pool = locked.length ? locked : cand;
+    pool.sort((a, b) => (b.quantifiable - a.quantifiable) || (b.n - a.n));
+    return pool[0] || null;
   };
   const mer = pick("meridian"), east = pick("east_low"), west = pick("west_low");
-  const havePhi = settings.latitude !== null;
   const res = {
     segs, mer, east, west,
     dA: null, dh: null, dA_se: null, dh_se: null,
-    azOnlyDirection: null, altOnlyDirection: null,
+    azSignOnly: false, altSignOnly: false,
+    azCorrection: null, altCorrection: null,
     assumptions: [], contradictions: [],
   };
-  const kOf = (g) => {
-    const phi = settings.latitude ?? 0;
-    const cphi = Math.cos((phi * Math.PI) / 180);
-    return { kA: -cphi * g.geo.cosH * OMEGA, kh: -g.geo.sinH * OMEGA };
+  const kOf = (a) => {
+    const lat = a.settings.latitude ?? 0;
+    const cphi = Math.cos((lat * Math.PI) / 180);
+    return { kA: -cphi * a.geo.cosH * OMEGA, kh: -a.geo.sinH * OMEGA };
   };
 
-  if (mer) {
-    // v = kA·ΔA；ΔA 东移为正
+  // 数值解：子午线 → ΔA
+  if (mer && mer.quantifiable) {
     const { kA } = kOf(mer);
     res.dA = mer.decRate_as_s / kA;
     res.dA_se = mer.se_as_s / Math.abs(kA);
-    res.azOnlyDirection = res.dA >= 0 ? "east" : "west";
   }
-  if (mer && east) {
-    const km = kOf(mer), ke = kOf(east);
-    // v_E = kA_E·ΔA + kh_E·Δh，先按子午线扣方位项
-    const vA_east = ke.kA * res.dA;
-    res.dh = (east.decRate_as_s - vA_east) / ke.kh;
-    res.dh_se = Math.sqrt((east.se_as_s / Math.abs(ke.kh)) ** 2 +
-      (ke.kA / ke.kh * res.dA_se) ** 2);
-    res.altOnlyDirection = res.dh >= 0 ? "up" : "down";
+  // 数值解：东低空，在已知 ΔA 基础上扣除方位项
+  const sideNumeric = {};
+  for (const [name, g] of [["east", east], ["west", west]]) {
+    if (!g || !g.quantifiable) continue;
+    const k = kOf(g);
+    let dh = null, se = g.se_as_s / Math.abs(k.kh);
+    if (res.dA !== null) {
+      dh = (g.decRate_as_s - k.kA * res.dA) / k.kh;
+      se = Math.sqrt((g.se_as_s / Math.abs(k.kh)) ** 2 +
+        ((k.kA / k.kh) * (res.dA_se || 0)) ** 2);
+    }
+    sideNumeric[name] = { dh, se, g };
   }
-  if (mer && west) {
-    const km = kOf(mer), kw = kOf(west);
-    const vA_west = kw.kA * res.dA;
-    const dh = (west.decRate_as_s - vA_west) / kw.kh;
-    const dh_se = Math.sqrt((west.se_as_s / Math.abs(kw.kh)) ** 2 +
-      (kw.kA / kw.kh * res.dA_se) ** 2);
-    if (res.dh === null) { res.dh = dh; res.dh_se = dh_se; res.altOnlyDirection = res.dh >= 0 ? "up" : "down"; }
+  if (sideNumeric.east && sideNumeric.east.dh !== null) {
+    res.dh = sideNumeric.east.dh; res.dh_se = sideNumeric.east.se;
+  }
+  if (sideNumeric.west && sideNumeric.west.dh !== null) {
+    const w = sideNumeric.west;
+    if (res.dh === null) { res.dh = w.dh; res.dh_se = w.se; }
     else {
-      // 东、西两段独立估计高度，交叉验证
-      if (Math.sign(res.dh) !== Math.sign(dh) &&
-          Math.abs(res.dh) > 2 * res.dh_se && Math.abs(dh) > 2 * dh_se)
-        res.contradictions.push("东低空与西低空推出的高度误差符号相反，请检查翻转/刻度方向设置或测段可信度。");
+      const e = sideNumeric.east;
+      if (Math.sign(res.dh) !== Math.sign(w.dh) &&
+          Math.abs(res.dh) > 2 * res.dh_se && Math.abs(w.dh) > 2 * w.se)
+        res.contradictions.push("东、西低空推出的高度误差符号相反，请检查翻转/刻度方向或测段可信度，勿按单段调整。");
       else {
-        const w1 = 1 / (res.dh_se ** 2), w2 = 1 / (dh_se ** 2);
-        res.dh = (res.dh * w1 + dh * w2) / (w1 + w2);
+        const w1 = 1 / (res.dh_se ** 2), w2 = 1 / (w.se ** 2);
+        res.dh = (res.dh * w1 + w.dh * w2) / (w1 + w2);
         res.dh_se = 1 / Math.sqrt(w1 + w2);
-        res.altOnlyDirection = res.dh >= 0 ? "up" : "down";
       }
     }
   }
-  if (!mer && east && west) {
-    // 两低空段联立解 ΔA、Δh
+
+  // 数值解：无子午线，东西低空联立
+  if (res.dA === null && east && west && east.quantifiable && west.quantifiable) {
     const ke = kOf(east), kw = kOf(west);
     const sol = Calc.solve2(ke.kA, ke.kh, kw.kA, kw.kh,
       east.decRate_as_s, west.decRate_as_s);
     if (sol) {
       res.dA = sol.x; res.dh = sol.y;
-      res.azOnlyDirection = res.dA >= 0 ? "east" : "west";
-      res.altOnlyDirection = res.dh >= 0 ? "up" : "down";
-      res.assumptions.push("无子午线段，方位/高度由东、西低空两段联立求解；若两段不对称，误差较大。");
+      res.assumptions.push("无子午线段：方位/高度由东、西低空两段联立求出；两段不对称时误差较大。");
     }
   }
-  if (!mer && (east || west) && !(east && west)) {
-    const g = east || west;
-    res.altOnlyDirection = g.decRate_as_s * g.geo.sinH <= 0 ? "up" : "down";
-    // 东天: v=kh·dh 主导, kh=-sinH>0；v>0 北漂→dh>0 抬高。西天 kh<0：v>0→dh<0 降低
-    res.assumptions.push(`${east ? "仅东" : "仅西"}低空段：只能在“方位轴已校准”的前提下给高度轴方向，无法分离残余方位误差。`);
+
+  // —— 仅方向（符号）回退 ——
+  // 子午线：sinH≈0 高度项可忽略，v 与 ΔA 反号（kA<0），修正方向与 v 同向
+  if (res.dA === null && mer && mer.usable) {
+    res.azSignOnly = true;
+    res.dA_sign = mer.decSign;
+    // 记录方向量以便 UI：观测到北漂(+)→极轴偏西→向东拧
+    res.azCorrection = mer.decSign > 0 ? "east" : "west";
+    res.assumptions.push("子午线方向由漂移符号直接判读（高度项在 H≈0 时≈0），未标定角尺度故不给量。");
   }
-  if (!havePhi && (res.dA !== null || res.dh !== null))
-    res.assumptions.push("未填纬度：只能给方向，不能估算调整角秒数。");
-  // 估计值 dA/dh 是“现有极轴误差”（东移/抬高为正）；修正动作必须与之反向。
-  res.azCorrection = res.dA === null ? null : (res.dA > 0 ? "west" : "east");
-  res.altCorrection = res.altOnlyDirection === null ? null
-    : (res.dh !== null ? (res.dh > 0 ? "down" : "up")
-       : (res.altOnlyDirection === "up" ? "down" : "up"));
+  // 单低空段（方位轴已校准的前提下）给高度方向
+  const altFromSign = (g) => {
+    if (!g || !g.usable) return null;
+    // 东天 kh>0：北漂→偏高→降低；西天 kh<0：北漂→偏低→抬高
+    const corr = g.geo.sinH < 0 ? (g.decSign > 0 ? "down" : "up")
+                               : (g.decSign > 0 ? "up" : "down");
+    return corr;
+  };
+  if (res.dh === null && res.altCorrection === null) {
+    const ce = altFromSign(east), cw = altFromSign(west);
+    if (ce && cw) {
+      if (ce === cw) res.altCorrection = ce;
+      else res.contradictions.push("东、西低空的漂移符号给出相反的高度调整方向，无法仅靠方向定夺，请加角尺度或复测。");
+      res.altSignOnly = true;
+      res.assumptions.push("无子午线数值结果：高度方向假设方位轴已先行校准；若方位未校，低空漂移含方位成分。");
+    } else if (ce || cw) {
+      res.altCorrection = ce || cw;
+      res.altSignOnly = true;
+      res.assumptions.push(`${ce ? "仅东" : "仅西"}低空段给出高度方向，前提是方位轴已校准；未标定角尺度故不给量。`);
+    }
+  }
+
+  // 数值结果的修正方向（与现有极轴误差反向）
+  if (res.dA !== null) res.azCorrection = res.dA > 0 ? "west" : "east";
+  if (res.dh !== null) res.altCorrection = res.dh > 0 ? "down" : "up";
+  if (!sessionSettings || sessionSettings.latitude === null)
+    res.assumptions.push("未填纬度：只给方向，不估算调整角秒数。");
   return res;
 }
 
@@ -697,17 +769,19 @@ function renderFov(analyses) {
     "白虚线=恒星周日运动方向（向西）"));
 
   // 红色漂移箭头：取当前轮次最显著测段
-  const cur = analyses.find((a) => a.seg.kind === state.segKind && a.decRate_as_s !== null && a.usable);
+  const cur = analyses.find((a) => a.seg.kind === state.segKind && a.usable &&
+    (a.decRate_as_s !== null || a.decSign !== 0));
   if (cur) {
-    const v = cur.decRate_as_s;
-    const mag = Math.min(0.9, 0.25 + Math.abs(v) * 40);
-    const d = [N[0] * Math.sign(v) * mag, N[1] * Math.sign(v) * mag];
+    const sign = cur.decRate_as_s !== null ? Math.sign(cur.decRate_as_s) : cur.decSign;
+    const mag = cur.decRate_as_s !== null
+      ? Math.min(0.9, 0.25 + Math.abs(cur.decRate_as_s) * 40) : 0.6;
+    const d = [N[0] * sign * mag, N[1] * sign * mag];
     svg.appendChild(el("line", {
       x1: C, y1: C, x2: C + d[0] * R, y2: C + d[1] * R,
       stroke: "#f85149", "stroke-width": 2.4, "marker-end": "url(#arrowD)",
     }));
     svg.appendChild(el("text", { x: C, y: 16, fill: "#f85149", "font-size": 11, "text-anchor": "middle" },
-      `红箭头=当前赤纬漂移方向（${v >= 0 ? "向北" : "向南"}）`));
+      `红箭头=当前赤纬漂移方向（${sign > 0 ? "向北" : "向南"}）`));
   }
   $("fovHint").textContent =
     `N 为真实北天方向，已按“${({none:"无翻转",diag:"天顶镜(上下翻转)",mirror:"反射(左右翻转)",rotate180:"旋转180°",custom:"自定义旋转"})[s.flip]}”映射；` +
@@ -726,23 +800,38 @@ function renderSegResults(analyses) {
   for (const a of analyses) {
     const d = document.createElement("div");
     d.className = `seg-result ${a.seg.kind}${a.seg.locked ? " locked" : ""}`;
+    const ss = a.settings;
+    const posTxt = ss.azimuth !== null && ss.altitude !== null
+      ? `A=${ss.azimuth}° h=${ss.altitude}°` : "无位置快照";
     const geoTxt = a.geo ? `H=${(a.geo.H * 180 / Math.PI).toFixed(1)}° δ=${(a.geo.dec * 180 / Math.PI).toFixed(1)}°` : "";
+    let driftLine = "";
+    if (a.decRate_as_s !== null)
+      driftLine = `　赤纬漂移：<b style="color:${a.decRate_as_s >= 0 ? "#79c0ff" : "#ffa657"}">${a.decRate_as_s >= 0 ? "向北" : "向南"} ${Math.abs(a.decRate_as_s).toFixed(4)}″/s</b>`;
+    else if (a.usable && a.decSign)
+      driftLine = `　赤纬漂移方向：<b style="color:${a.decSign > 0 ? "#79c0ff" : "#ffa657"}">${a.decSign > 0 ? "向北 ↑" : "向南 ↓"}</b>（无角尺度，仅方向）`;
+    const mismatchWarn = a.snapshotMismatch
+      ? `<li>当前表单位置（A=${state.bundle.settings.azimuth}° h=${state.bundle.settings.altitude}°）与本测段快照（A=${ss.azimuth}° h=${ss.altitude}°）不同；本测段仍按快照解算，改目标不会污染旧段。</li>` : "";
     d.innerHTML =
-      `<h3><span>${KIND_LABEL[a.seg.kind]} ${a.seg.locked ? "🔒" : ""}</span><span class="hint">${a.n} 点 · ${a.duration_s.toFixed(0)}s ${geoTxt}</span></h3>` +
-      `<div class="rate">斜率：<b>${a.slope_tick_min === null ? "—" : (a.slope_tick_min >= 0 ? "+" : "") + a.slope_tick_min.toFixed(3) + " 格/分"}</b>` +
-      (a.decRate_as_s === null ? "" :
-       `　赤纬漂移：<b style="color:${a.decRate_as_s >= 0 ? "#79c0ff" : "#ffa657"}">${a.decRate_as_s >= 0 ? "向北" : "向南"} ${Math.abs(a.decRate_as_s).toFixed(4)}″/s</b>`) + `</div>` +
+      `<h3><span>${KIND_LABEL[a.seg.kind]} ${a.seg.locked ? "🔒" : ""}</span><span class="hint">${a.n} 点 · ${a.duration_s.toFixed(0)}s · ${posTxt} ${geoTxt}</span></h3>` +
+      `<div class="rate">斜率：<b>${a.slope_tick_min === null ? "—" : (a.slope_tick_min >= 0 ? "+" : "") + a.slope_tick_min.toFixed(3) + " 格/分"}</b>${driftLine}</div>` +
       `<ul class="warnings">` +
       a.good.map((x) => `<li class="good">✓ ${x}</li>`).join("") +
+      mismatchWarn +
       a.warnings.map((x) => `<li>⚠ ${x}</li>`).join("") +
       a.refusals.map((x) => `<li class="bad">⛔ ${x}</li>`).join("") +
       `</ul>` +
       `<div class="ops">` +
       `<button data-op="lock">${a.seg.locked ? "解锁" : "锁定为可信测段"}</button>` +
+      (a.n === 0 ? `<button data-op="repos">用当前位置更新本段</button>` : ``) +
       (a.outlierIdx.size ? `<button data-op="excludeOutliers">排除全部异常点</button>` : ``) +
       `</div>`;
     d.querySelector('[data-op="lock"]').addEventListener("click", async () => {
       await api("PATCH", `/api/segments/${a.seg.id}`, { locked: !a.seg.locked });
+      await refreshBundle();
+    });
+    const rp = d.querySelector('[data-op="repos"]');
+    if (rp) rp.addEventListener("click", async () => {
+      await api("PATCH", `/api/segments/${a.seg.id}`, { snapshot: geoSnapshot() });
       await refreshBundle();
     });
     const eo = d.querySelector('[data-op="excludeOutliers"]');
@@ -769,9 +858,12 @@ function renderAdvice(res) {
   const havePhi = s.latitude !== null;
   const canAmount = haveScale && havePhi;
 
-  if (!res.mer && !res.east && !res.west) {
-    box.innerHTML = `<div class="advice"><p class="refuse">暂不下结论：当前轮次还没有可信测段（点数不足、时长不足或目标位置不合适时，不会硬给调整方向）。</p>
-      <p class="basis">建议流程：先在子午线附近高点测方位轴，再到东/西低空测高度轴；每段 ≥60 秒、≥4 点。</p></div>`;
+  const anySeg = res.mer || res.east || res.west;
+  const anyAz = res.dA !== null || res.azCorrection;
+  const anyAlt = res.dh !== null || res.altCorrection;
+  if (!anySeg) {
+    box.innerHTML = `<div class="advice"><p class="refuse">暂不下结论：当前轮次还没有满足基本条件的测段（点数不足、时长不足或目标位置不合适时，不会硬给调整方向）。</p>
+      <p class="basis">建议流程：先在子午线附近高点测方位轴，再到东/西低空测高度轴；每段建议 ≥60 秒、≥4 点。</p></div>`;
     return;
   }
   let html = `<div class="advice">`;
@@ -779,32 +871,50 @@ function renderAdvice(res) {
   const fixText = { east: "把方位轴向<b>东</b>拧（极轴朝东转）", west: "把方位轴向<b>西</b>拧",
                     up: "把高度轴<b>抬高</b>（仰角升高）", down: "把高度轴<b>降低</b>（仰角下降）" };
 
+  // 方位轴
   html += `<div class="axis"><div>方位角轴（水平旋转）：</div>`;
   if (res.dA !== null && res.azCorrection) {
     html += `<div class="dir az">${fixText[res.azCorrection]}</div>`;
-    if (canAmount)
-      html += `<div class="amount">判读：当前${errText[res.azOnlyDirection]}约 <b>${Math.abs(res.dA).toFixed(0)}″</b>（≈${(Math.abs(res.dA) / 60).toFixed(2)}′），` +
-        `故向反方向回调该量` + (res.dA_se ? `（拟合不确定度 ±${res.dA_se.toFixed(0)}″）` : "") + `。</div>`;
-    else html += `<div class="amount">${haveScale ? "未填纬度，" : "未填角尺度，"}只给方向不给量。</div>`;
-  } else html += `<div class="amount">尚无子午线段，方位轴方向未定。</div>`;
+    if (canAmount) {
+      const errDir = res.dA > 0 ? "east" : "west";
+      html += `<div class="amount">判读：当前${errText[errDir]}约 <b>${Math.abs(res.dA).toFixed(0)}″</b>（≈${(Math.abs(res.dA) / 60).toFixed(2)}′），向反方向回调该量` +
+        (res.dA_se ? `（拟合不确定度 ±${res.dA_se.toFixed(0)}″）` : "") + `。</div>`;
+    } else {
+      html += `<div class="amount">${haveScale ? "未填纬度，" : "未填角尺度，"}只给方向不给量。</div>`;
+    }
+  } else if (res.azCorrection) {
+    html += `<div class="dir az">${fixText[res.azCorrection]}</div>
+      <div class="amount">仅方向：子午线段显示赤纬${res.dA_sign > 0 ? "向北" : "向南"}漂移${haveScale ? "" : "（未标定角尺度）"}。</div>`;
+  } else {
+    html += `<div class="amount">尚无可用子午线段，方位轴方向未定。</div>`;
+  }
   html += `</div>`;
 
+  // 高度轴
   html += `<div class="axis"><div>高度轴（仰角）：</div>`;
   if (res.dh !== null && res.altCorrection) {
     html += `<div class="dir alt">${fixText[res.altCorrection]}</div>`;
-    if (canAmount)
-      html += `<div class="amount">判读：当前${errText[res.altOnlyDirection]}约 <b>${Math.abs(res.dh).toFixed(0)}″</b>（≈${(Math.abs(res.dh) / 60).toFixed(2)}′），` +
-        `故向反方向回调该量` + (res.dh_se ? `（不确定度 ±${res.dh_se.toFixed(0)}″）` : "") + `。</div>`;
-    else html += `<div class="amount">${haveScale ? "未填纬度，" : "未填角尺度，"}只给方向不给量。</div>`;
+    if (canAmount) {
+      const errDir = res.dh > 0 ? "up" : "down";
+      html += `<div class="amount">判读：当前${errText[errDir]}约 <b>${Math.abs(res.dh).toFixed(0)}″</b>（≈${(Math.abs(res.dh) / 60).toFixed(2)}′），向反方向回调该量` +
+        (res.dh_se ? `（不确定度 ±${res.dh_se.toFixed(0)}″）` : "") + `。</div>`;
+    } else {
+      html += `<div class="amount">${haveScale ? "未填纬度，" : "未填角尺度，"}只给方向不给量。</div>`;
+    }
   } else if (res.altCorrection) {
-    html += `<div class="dir alt">${fixText[res.altCorrection]}</div><div class="amount">仅方向（前提：方位轴已校准）。</div>`;
-  } else html += `<div class="amount">尚无低空测段，高度轴方向未定。</div>`;
+    html += `<div class="dir alt">${fixText[res.altCorrection]}</div>
+      <div class="amount">仅方向${haveScale ? "" : "（未标定角尺度）"}。</div>`;
+  } else {
+    html += `<div class="amount">尚无可用低空测段，高度轴方向未定。</div>`;
+  }
   html += `</div>`;
 
   if (res.assumptions.length)
-    html += `<p class="basis">前提说明：${res.assumptions.join("　")}</p>`;
+    html += `<p class="basis">前提说明：${[...new Set(res.assumptions)].join("　")}</p>`;
   if (res.contradictions.length)
-    html += `<p class="refuse">测段间矛盾：${res.contradictions.join("　")}</p>`;
+    html += `<p class="refuse">测段间矛盾：${[...new Set(res.contradictions)].join("　")}</p>`;
+  if (!anyAz || !anyAlt)
+    html += `<p class="basis">${!anyAz ? "方位轴需在子午线附近（H≈0）高一点的目标上观测；" : ""}${!anyAlt ? "高度轴需在东或西天、高度 15–40° 的目标上观测。" : ""}</p>`;
   html += `</div>`;
   box.innerHTML = html;
 }
@@ -816,10 +926,12 @@ function roundResiduals() {
   const out = [];
   for (const round of state.bundle.rounds) {
     const res = analyzeRound(round, s);
-    const merRate = res.mer ? res.mer.decRate_as_s : null;
-    const altRate = (res.east || res.west)
-      ? ((res.east || res.west).decRate_as_s) : null;
-    out.push({ round, res, merRate, altRate });
+    const mer = res.mer, low = res.east || res.west;
+    const merRate = mer ? mer.decRate_as_s : null;
+    const altRate = low ? low.decRate_as_s : null;
+    const merSign = mer ? mer.decSign : null;
+    const altSign = low ? low.decSign : null;
+    out.push({ round, res, merRate, altRate, merSign, altSign });
   }
   return out;
 }
@@ -830,27 +942,27 @@ function renderRounds() {
   if (!state.bundle) { $("contradictionBox").innerHTML = ""; return; }
   const rows = roundResiduals();
   const fmt = (v) => v === null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(4)}″/s`;
-  const fmtTick = (r) => {
-    const segs = r.res.segs;
-    const mer = segs.find((x) => x.seg.kind === "meridian" && x.slope_tick_min !== null);
-    const low = segs.find((x) => x.seg.kind !== "meridian" && x.slope_tick_min !== null);
-    return { mer: mer ? mer.slope_tick_min : null, low: low ? low.slope_tick_min : null };
-  };
+  const arrow = (sg) => sg === null || sg === 0 ? "—" : (sg > 0 ? "↑北漂" : "↓南漂");
+  const tickTxt = (a) => a && a.slope_tick_min !== null ? `${a.slope_tick_min >= 0 ? "+" : ""}${a.slope_tick_min.toFixed(2)} 格/分` : "—";
   const s = state.bundle.settings;
   rows.forEach((r, i) => {
     const tr = document.createElement("tr");
     const prev = i > 0 ? rows[i - 1] : null;
     let cls = "";
-    if (prev) {
-      const nowMag = (Math.abs(r.merRate ?? 0) + Math.abs(r.altRate ?? 0));
-      const prevMag = (Math.abs(prev.merRate ?? 0) + Math.abs(prev.altRate ?? 0));
+    // 有数值按数值幅度比，否则按残余方向是否消失来粗判
+    const mag = (x) => Math.abs(x.merRate ?? 0) + Math.abs(x.altRate ?? 0);
+    const haveNum = rows.some((x) => x.merRate !== null || x.altRate !== null);
+    if (prev && haveNum) {
+      const nowMag = mag(r), prevMag = mag(prev);
       if (nowMag < prevMag * 0.8) cls = "improved";
       if (nowMag > prevMag * 1.2) cls = "worse";
     }
     tr.className = cls;
     const adj = r.round.adjustment || {};
-    const azCell = s.arcsecPerTick ? fmt(r.merRate) : (fmtTick(r).mer === null ? "—" : `${fmtTick(r).mer.toFixed(2)} 格/分`);
-    const altCell = s.arcsecPerTick ? fmt(r.altRate) : (fmtTick(r).low === null ? "—" : `${fmtTick(r).low.toFixed(2)} 格/分`);
+    const azCell = r.merRate !== null ? fmt(r.merRate)
+      : (s.arcsecPerTick ? (r.res.mer ? tickTxt(r.res.mer) : "—") : arrow(r.merSign));
+    const altCell = r.altRate !== null ? fmt(r.altRate)
+      : (s.arcsecPerTick ? tickTxt(r.res.east || r.res.west) : arrow(r.altSign));
     tr.innerHTML =
       `<td>第 ${r.round.seq} 轮${r.round.id === state.roundId ? " ◀" : ""}</td>` +
       `<td class="resid">${azCell}</td><td class="resid">${altCell}</td>` +
@@ -880,6 +992,13 @@ function renderRounds() {
     const ma = Math.abs(a.dA ?? 0), mb = Math.abs(b.dA ?? 0);
     if (a.dA !== null && b.dA !== null && mb > ma * 1.5)
       msgs.push({ cls: "warn", t: `第 ${rows[i].round.seq} 轮方位残余不降反增（${mb.toFixed(0)}″ vs ${ma.toFixed(0)}″），检查调节方向与回程间隙。` });
+    // 仅方向模式下，若相邻两轮的漂移符号翻转，同样提示（可能过冲/拧反）
+    if (a.dA === null && b.dA === null &&
+        rows[i - 1].merSign && rows[i].merSign && rows[i - 1].merSign !== rows[i].merSign)
+      msgs.push({ cls: "warn", t: `第 ${rows[i - 1].round.seq}、${rows[i].round.seq} 轮子午线漂移方向相反（仅方向判读）：可能调整过冲或拧反，请复测确认。` });
+    if (rows[i - 1].altSign && rows[i].altSign && rows[i - 1].altSign !== rows[i].altSign &&
+        a.dh === null && b.dh === null)
+      msgs.push({ cls: "warn", t: `第 ${rows[i - 1].round.seq}、${rows[i].round.seq} 轮低空漂移方向相反（仅方向判读），请复测确认。` });
   }
   if (rows.length >= 2 && !msgs.length)
     msgs.push({ cls: "good", t: "相邻两轮调整方向一致、残余漂移未出现反转；若绝对值逐轮减小即收敛良好。" });
@@ -936,16 +1055,20 @@ function renderPrintSheet(res, analyses) {
   const segRows = [];
   if (currentRound()) {
     for (const a of analyses) {
-      segRows.push(`<tr><td>${KIND_LABEL[a.seg.kind]}${a.seg.locked ? "🔒" : ""}</td>
+      const ss = a.settings;
+      const driftCell = a.decRate_as_s !== null ? a.decRate_as_s.toFixed(4)
+        : (a.usable && a.decSign ? (a.decSign > 0 ? "向北↑(仅方向)" : "向南↓(仅方向)") : "—");
+      segRows.push(`<tr><td>${KIND_LABEL[a.seg.kind]}${a.seg.locked ? "🔒" : ""}<br><span class="sheet-note">A=${ss.azimuth ?? "—"}° h=${ss.altitude ?? "—"}°</span></td>
         <td>${a.n}</td><td>${a.duration_s.toFixed(0)}s</td>
         <td>${a.slope_tick_min === null ? "—" : a.slope_tick_min.toFixed(3)}</td>
-        <td>${a.decRate_as_s === null ? "—" : a.decRate_as_s.toFixed(4)}</td>
+        <td>${driftCell}</td>
         <td>${[...a.warnings, ...a.refusals].join("；") || "无"}</td></tr>`);
     }
   }
+  const signTxt = (v, sg) => v !== null ? v.toFixed(4) : (sg ? (sg > 0 ? "北漂(仅方向)" : "南漂(仅方向)") : "—");
   const roundRows = rows.map((r) => `<tr><td>第 ${r.round.seq} 轮</td>
-    <td>${r.merRate === null ? "—" : r.merRate.toFixed(4)}</td>
-    <td>${r.altRate === null ? "—" : r.altRate.toFixed(4)}</td>
+    <td>${signTxt(r.merRate, r.merSign)}</td>
+    <td>${signTxt(r.altRate, r.altSign)}</td>
     <td>${[r.round.adjustment && r.round.adjustment.az, r.round.adjustment && r.round.adjustment.alt].filter(Boolean).join("；") || "—"}</td></tr>`).join("");
   $("printContent").innerHTML = `
     <p>会话：${state.bundle.name}　打印时间：${now.toLocaleString()}</p>
@@ -965,8 +1088,10 @@ function renderPrintSheet(res, analyses) {
       ${segRows.join("") || "<tr><td colspan=6>无</td></tr>"}</table>
     <h3>调整结论（当前轮，为应执行的修正动作）</h3>
     <table><tr><th>方位轴</th><th>高度轴</th></tr><tr>
-      <td>${res.dA === null ? "未定" : `${res.azCorrection === "east" ? "向东拧" : "向西拧"} ${s.arcsecPerTick && s.latitude !== null ? Math.abs(res.dA).toFixed(0) + "″" : "（仅方向）"}`}</td>
-      <td>${res.dh === null && !res.altCorrection ? "未定" : `${res.altCorrection === "up" ? "抬高" : "降低"} ${res.dh !== null && s.arcsecPerTick && s.latitude !== null ? Math.abs(res.dh).toFixed(0) + "″" : "（仅方向）"}`}</td>
+      <td>${res.dA === null && !res.azCorrection ? "未定"
+        : `${res.azCorrection === "east" ? "向东拧" : "向西拧"} ${res.dA !== null && s.arcsecPerTick && s.latitude !== null ? Math.abs(res.dA).toFixed(0) + "″" : "（仅方向）"}`}</td>
+      <td>${res.dh === null && !res.altCorrection ? "未定"
+        : `${res.altCorrection === "up" ? "抬高" : "降低"} ${res.dh !== null && s.arcsecPerTick && s.latitude !== null ? Math.abs(res.dh).toFixed(0) + "″" : "（仅方向）"}`}</td>
     </tr></table>
     <p class="sheet-note">${(res.assumptions || []).join("　")}</p>
     <h3>逐轮残余漂移</h3>
@@ -987,16 +1112,22 @@ async function exportJSON() {
   URL.revokeObjectURL(a.href);
 }
 
-async function importJSON(file) {
+async function importJSON(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
   try {
-    const text = await file.value ? file.files[0].text() : "";
-    const data = JSON.parse(text);
+    const text = await file.text();
+    let data;
+    try { data = JSON.parse(text); }
+    catch (e) { throw new Error("文件不是合法 JSON：" + e.message); }
+    if (data.__export_format__ && data.__export_format__ !== "drift-align-station/v1")
+      throw new Error(`不支持的导出格式：${data.__export_format__}`);
     const r = await api("POST", "/api/import", data);
     await loadSessionList();
     if (r.session_ids && r.session_ids[0]) await loadBundle(r.session_ids[0]);
-    alert("导入成功。");
+    alert(`导入成功，已恢复 ${r.session_ids.length} 个会话。`);
   } catch (e) { alert("导入失败：" + e.message); }
-  file.value = "";
+  input.value = "";
 }
 
 /* ---------------- 事件绑定与启动 ---------------- */
@@ -1020,14 +1151,14 @@ function bind() {
     window.print();
   });
 
-  for (const id of ["hemisphere", "mountType", "flip", "scaleDir"])
-    $(id).addEventListener("change", scheduleSaveSettings);
-  for (const id of ["latitude", "azimuth", "altitude", "declination", "customRot", "arcsecPerTick"])
-    $(id).addEventListener("input", scheduleSaveSettings);
+  for (const id of ["hemisphere", "mountType", "latitude", "azimuth", "altitude",
+                    "declination", "flip", "customRot", "scaleDir", "arcsecPerTick"])
+    $(id).addEventListener("input", localSettingsChanged);
+  // change 事件保证 select/number 在键盘输入之外（滚轮、粘贴）也能即时重算
+  for (const id of ["hemisphere", "mountType", "flip", "scaleDir", "latitude",
+                    "azimuth", "altitude", "declination", "customRot", "arcsecPerTick"])
+    $(id).addEventListener("change", localSettingsChanged);
   $("flip").addEventListener("change", onFlipChange);
-  // 设置变化后本地即时刷新几何/视场
-  for (const id of ["hemisphere", "flip", "scaleDir", "latitude", "azimuth", "altitude", "arcsecPerTick", "customRot"])
-    $(id).addEventListener("input", () => { if (state.bundle) renderAll(); else renderGeometryHint(); });
 
   $("segKind").addEventListener("change", (e) => { state.segKind = e.target.value; renderAll(); });
   $("markBtn").addEventListener("click", markPoint);
@@ -1045,12 +1176,22 @@ function bind() {
     alert("已保存本轮调整记录。");
   });
 
-  // 热键（输入框内不拦截）
+  // 热键：刻度输入框内 Space=提交打点并保持焦点便于连续记录；
+  //       其他输入/选择控件内的按键一律不拦截。
   document.addEventListener("keydown", (e) => {
     const tag = (e.target.tagName || "").toLowerCase();
-    if (tag === "input" || tag === "select" || tag === "textarea") return;
-    if (e.code === "Space") { e.preventDefault(); markPoint(); }
-    else if (e.key === "u" || e.key === "U") { e.preventDefault(); undoPoint(); }
+    const inField = tag === "input" || tag === "select" || tag === "textarea";
+    const isTickField = e.target === $("tickInput");
+    if (inField && !isTickField) return;
+
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (state.busy) return;
+      markPoint().then(() => $("tickInput").focus());
+      return;
+    }
+    if (isTickField) return;   // 刻度框内只放行 Space，其余热键交给页面
+    if (e.key === "u" || e.key === "U") { e.preventDefault(); undoPoint(); }
     else if (e.key === "m" || e.key === "M") { $("segKind").value = "meridian"; state.segKind = "meridian"; renderAll(); }
     else if (e.key === "e" || e.key === "E") { $("segKind").value = "east_low"; state.segKind = "east_low"; renderAll(); }
     else if (e.key === "w" || e.key === "W") { $("segKind").value = "west_low"; state.segKind = "west_low"; renderAll(); }

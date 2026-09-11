@@ -65,6 +65,13 @@ CREATE INDEX IF NOT EXISTS idx_segments_round ON segments(round_id);
 CREATE INDEX IF NOT EXISTS idx_points_segment ON points(segment_id);
 """
 
+# 后续版本的轻量迁移：给测段增加“观测几何快照”列
+def _migrate(conn):
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(segments)")]
+    if "snapshot" not in cols:
+        conn.execute(
+            "ALTER TABLE segments ADD COLUMN snapshot TEXT NOT NULL DEFAULT '{}'")
+
 _db_lock = threading.Lock()
 
 
@@ -73,6 +80,7 @@ def get_db(path):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -112,6 +120,7 @@ def session_bundle(conn, sid):
                 "kind": g["kind"],
                 "locked": bool(g["locked"]),
                 "note": g["note"],
+                "snapshot": json.loads(g["snapshot"] or "{}"),
                 "created_at": g["created_at"],
                 "points": [],
             }
@@ -166,10 +175,12 @@ def import_bundle(conn, bundle, keep_ids=False):
             gid = g["id"] if keep_ids else uuid.uuid4().hex
             idmap_segments[g.get("id")] = gid
             conn.execute(
-                "INSERT INTO segments(id, round_id, kind, locked, note, created_at) "
-                "VALUES(?,?,?,?,?,?)",
+                "INSERT INTO segments(id, round_id, kind, locked, note, snapshot, created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
                 (gid, rid, g["kind"], 1 if g.get("locked") else 0,
-                 g.get("note", ""), g.get("created_at", now)),
+                 g.get("note", ""),
+                 json.dumps(g.get("snapshot", {}), ensure_ascii=False),
+                 g.get("created_at", now)),
             )
             for p in g.get("points", []):
                 pid = p["id"] if keep_ids else uuid.uuid4().hex
@@ -340,10 +351,11 @@ class Handler(BaseHTTPRequestHandler):
                         return self._error(400, "kind 必须是 meridian / east_low / west_low")
                     gid = uuid.uuid4().hex
                     conn.execute(
-                        "INSERT INTO segments(id,round_id,kind,locked,note,created_at) "
-                        "VALUES(?,?,?,?,?,?)",
+                        "INSERT INTO segments(id,round_id,kind,locked,note,snapshot,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
                         (gid, rid, kind, 1 if data.get("locked") else 0,
-                         str(data.get("note", "")), now),
+                         str(data.get("note", "")),
+                         json.dumps(data.get("snapshot", {}), ensure_ascii=False), now),
                     )
                     conn.execute("UPDATE sessions SET updated_at=? WHERE id=?",
                                  (now, r["session_id"]))
@@ -451,11 +463,15 @@ class Handler(BaseHTTPRequestHandler):
                     g = conn.execute("SELECT * FROM segments WHERE id=?", (gid,)).fetchone()
                     if not g:
                         return self._error(404, "测段不存在")
+                    snap = json.loads(g["snapshot"] or "{}") if "snapshot" in g.keys() else {}
+                    if isinstance(data.get("snapshot"), dict):
+                        snap.update(data["snapshot"])
                     conn.execute(
-                        "UPDATE segments SET kind=?, locked=?, note=? WHERE id=?",
+                        "UPDATE segments SET kind=?, locked=?, note=?, snapshot=? WHERE id=?",
                         (data.get("kind", g["kind"]),
                          1 if data.get("locked", bool(g["locked"])) else 0,
-                         str(data.get("note", g["note"])), gid),
+                         str(data.get("note", g["note"])),
+                         json.dumps(snap, ensure_ascii=False), gid),
                     )
                     r = conn.execute("SELECT session_id FROM rounds WHERE id=?",
                                      (g["round_id"],)).fetchone()
