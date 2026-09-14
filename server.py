@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS points (
     excluded    INTEGER NOT NULL DEFAULT 0,
     note        TEXT NOT NULL DEFAULT ''
 );
+-- 视场方向实测标定的命名配置（相机/天顶镜/转接角组合）。
+-- 只保存由两条位移向量算出的结果，不保存任何图片。
+CREATE TABLE IF NOT EXISTS calibrations (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    result      TEXT NOT NULL DEFAULT '{}',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
 CREATE INDEX IF NOT EXISTS idx_segments_round ON segments(round_id);
 CREATE INDEX IF NOT EXISTS idx_points_segment ON points(segment_id);
@@ -85,6 +94,88 @@ def get_db(path):
 
 
 # ---------------------------------------------------------------- 序列化
+
+def _dump(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+
+
+def validate_calib_result(res):
+    """对标定结果做轻量校验；空对象表示“清除结果”。返回错误消息或 None。"""
+    if res is None:
+        return None
+    if not isinstance(res, dict):
+        return "result 必须是对象"
+    if not res:
+        return None
+    rot = res.get("rotationDeg")
+    if isinstance(rot, bool) or not isinstance(rot, (int, float)) or not (0 <= rot < 360):
+        return "rotationDeg 必须是 [0,360) 内的数值"
+    for k in ("west", "north"):
+        v = res.get(k)
+        if not isinstance(v, dict):
+            return f"{k} 向量缺失"
+        for c in ("dx", "dy"):
+            x = v.get(c)
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or abs(x) > 1.5:
+                return f"{k}.{c} 非法（应为单位向量分量）"
+    if res.get("scaleDir") not in (None, "N", "S"):
+        return "scaleDir 必须是 \"N\"/\"S\" 或 null"
+    return None
+
+
+def calib_row(conn, cid):
+    r = conn.execute("SELECT * FROM calibrations WHERE id=?", (cid,)).fetchone()
+    if r is None:
+        return None
+    return {"id": r["id"], "name": r["name"], "result": json.loads(r["result"] or "{}"),
+            "created_at": r["created_at"], "updated_at": r["updated_at"]}
+
+
+def list_calibrations(conn):
+    rows = conn.execute("SELECT * FROM calibrations ORDER BY updated_at DESC").fetchall()
+    return [{"id": r["id"], "name": r["name"], "result": json.loads(r["result"] or "{}"),
+             "created_at": r["created_at"], "updated_at": r["updated_at"]} for r in rows]
+
+
+def import_calibrations(conn, cals):
+    """导入标定配置；按 名称+结果 去重，返回 {旧id: 新id} 供会话内引用重映射。"""
+    idmap = {}
+    if not cals:
+        return idmap
+    now = int(time.time() * 1000)
+    existing = conn.execute("SELECT id, name, result FROM calibrations").fetchall()
+    for c in cals:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "导入配置")[:80]
+        res = c.get("result") or {}
+        if validate_calib_result(res):
+            res = {}
+        res_json = _dump(res)
+        found = None
+        for r in existing:
+            if r["name"] == name and r["result"] == res_json:
+                found = r["id"]
+                break
+        if found:
+            idmap[c.get("id")] = found
+            continue
+        nid = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO calibrations(id,name,result,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (nid, name, res_json, now, now))
+        existing.append({"id": nid, "name": name, "result": res_json})
+        idmap[c.get("id")] = nid
+    return idmap
+
+
+def _remap_calib_ref(obj, calib_map):
+    """把 settings.calibration / snapshot.calibration 里的 profileId 重映射到新 id。"""
+    if isinstance(obj, dict):
+        cal = obj.get("calibration")
+        if isinstance(cal, dict) and cal.get("profileId") in calib_map:
+            cal["profileId"] = calib_map[cal["profileId"]]
+
 
 def session_bundle(conn, sid):
     """导出单个会话的完整数据（含全部轮次/测段/打点）。"""
@@ -148,16 +239,20 @@ def next_seq(conn, sid):
     return row["n"]
 
 
-def import_bundle(conn, bundle, keep_ids=False):
+def import_bundle(conn, bundle, keep_ids=False, calib_map=None):
     """导入一个会话 bundle；默认重新分配全部 id，避免主键冲突。"""
+    calib_map = calib_map or {}
     now = int(time.time() * 1000)
     sid = bundle.get("id") if keep_ids else uuid.uuid4().hex
     if not sid:
         sid = uuid.uuid4().hex
+    settings = bundle.get("settings", {})
+    if isinstance(settings, dict):
+        _remap_calib_ref(settings, calib_map)
     conn.execute(
         "INSERT INTO sessions(id, name, settings, created_at, updated_at) VALUES(?,?,?,?,?)",
         (sid, bundle.get("name", "导入的会话"),
-         json.dumps(bundle.get("settings", {}), ensure_ascii=False),
+         json.dumps(settings, ensure_ascii=False),
          bundle.get("created_at", now), now),
     )
     idmap_rounds, idmap_segments = {}, {}
@@ -174,12 +269,15 @@ def import_bundle(conn, bundle, keep_ids=False):
         for g in r.get("segments", []):
             gid = g["id"] if keep_ids else uuid.uuid4().hex
             idmap_segments[g.get("id")] = gid
+            snap = g.get("snapshot", {})
+            if isinstance(snap, dict):
+                _remap_calib_ref(snap, calib_map)
             conn.execute(
                 "INSERT INTO segments(id, round_id, kind, locked, note, snapshot, created_at) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (gid, rid, g["kind"], 1 if g.get("locked") else 0,
                  g.get("note", ""),
-                 json.dumps(g.get("snapshot", {}), ensure_ascii=False),
+                 json.dumps(snap, ensure_ascii=False),
                  g.get("created_at", now)),
             )
             for p in g.get("points", []):
@@ -280,6 +378,9 @@ class Handler(BaseHTTPRequestHandler):
                         "n_rounds": r["n_rounds"],
                     } for r in rows])
 
+                if path == "/api/calibrations":
+                    return self._json(list_calibrations(conn))
+
                 parts = [p for p in path.split("/") if p]
                 # /api/sessions/<sid>
                 if len(parts) == 3 and parts[1] == "sessions":
@@ -291,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not b:
                         return self._error(404, "会话不存在")
                     b["__export_format__"] = "drift-align-station/v1"
+                    # 标定依据随包导出，便于换机恢复与核对
+                    b["calibrations"] = list_calibrations(conn)
                     return self._json(b)
                 return self._error(404, "未知接口")
             except Exception as e:  # noqa: BLE001
@@ -385,6 +488,24 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                     return self._json({"id": pid}, 201)
 
+                # /api/calibrations —— 新建命名标定配置
+                if path == "/api/calibrations":
+                    name = str(data.get("name") or "").strip()[:80]
+                    if not name:
+                        return self._error(400, "需要配置名称")
+                    result = data.get("result") or {}
+                    err = validate_calib_result(result)
+                    if err:
+                        return self._error(400, err)
+                    cid = uuid.uuid4().hex
+                    conn.execute(
+                        "INSERT INTO calibrations(id,name,result,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (cid, name, _dump(result), now, now),
+                    )
+                    conn.commit()
+                    return self._json(calib_row(conn, cid), 201)
+
                 # /api/import  —— 单会话或 {sessions:[...]}
                 if path == "/api/import":
                     bundles = data.get("sessions") if isinstance(data, dict) else None
@@ -394,7 +515,8 @@ class Handler(BaseHTTPRequestHandler):
                     for b in bundles:
                         if not isinstance(b, dict):
                             continue
-                        ids.append(import_bundle(conn, b))
+                        cmap = import_calibrations(conn, b.get("calibrations"))
+                        ids.append(import_bundle(conn, b, calib_map=cmap))
                     conn.commit()
                     return self._json({"session_ids": ids}, 201)
 
@@ -437,6 +559,29 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     conn.commit()
                     return self._json(session_bundle(conn, sid))
+
+                # /api/calibrations/<cid>
+                if len(parts) == 3 and parts[1] == "calibrations":
+                    cid = parts[2]
+                    row = conn.execute(
+                        "SELECT * FROM calibrations WHERE id=?", (cid,)).fetchone()
+                    if not row:
+                        return self._error(404, "标定配置不存在")
+                    name = row["name"]
+                    if "name" in data:
+                        name = str(data.get("name") or "").strip()[:80] or row["name"]
+                    result_json = row["result"]
+                    if "result" in data:
+                        err = validate_calib_result(data.get("result") or {})
+                        if err:
+                            return self._error(400, err)
+                        result_json = _dump(data.get("result") or {})
+                    conn.execute(
+                        "UPDATE calibrations SET name=?, result=?, updated_at=? WHERE id=?",
+                        (name, result_json, now, cid),
+                    )
+                    conn.commit()
+                    return self._json(calib_row(conn, cid))
 
                 # /api/rounds/<rid>
                 if len(parts) == 3 and parts[1] == "rounds":
@@ -522,6 +667,10 @@ class Handler(BaseHTTPRequestHandler):
                         "UPDATE sessions SET updated_at=? WHERE id=?",
                         (int(time.time() * 1000), sid))
 
+                if len(parts) == 3 and parts[1] == "calibrations":
+                    conn.execute("DELETE FROM calibrations WHERE id=?", (parts[2],))
+                    conn.commit()
+                    return self._json({"ok": True})
                 if len(parts) == 3 and parts[1] == "sessions":
                     conn.execute("DELETE FROM sessions WHERE id=?", (parts[2],))
                     conn.commit()

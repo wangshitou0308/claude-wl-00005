@@ -75,6 +75,7 @@
         </label>
       </div>
       <p class="hint" id="geometryHint"></p>
+      <p class="hint" id="activeCalibInfo"></p>
     </div>
 
     <div class="card" id="observeCard">
@@ -120,6 +121,79 @@
 
   <!-- 中栏：轨迹与视场 -->
   <section class="col col-center">
+    <div class="card" id="calibCard">
+      <h2>视场方向实测标定 <span class="hint">（图片仅经对象 URL 本地预览，不上传、不落库）</span></h2>
+      <div class="calib-prof-row">
+        <label>命名配置
+          <select id="calibProfileSelect"></select>
+        </label>
+        <label class="grow">配置名
+          <input id="calibName" type="text" placeholder="如 ASI533 + 天顶镜 + 转接0°">
+        </label>
+        <button id="calibApplyProfileBtn" type="button"
+                title="把所选配置的已存结果应用到当前会话：只重算未锁定测段，已锁定测段保留旧快照">应用所选配置</button>
+        <button id="calibDeleteBtn" type="button" class="ghost danger">删除配置</button>
+      </div>
+      <p class="hint" id="calibProfileInfo"></p>
+
+      <details class="calib-measure" open>
+        <summary>实测流程：停跟踪测西向 → 赤纬微动测北向（也可直接填像素坐标）</summary>
+        <div class="calib-step">
+          <h3>步骤一 · 天球西向：暂停跟踪，间隔 30–60 秒拍两张，在两张图上点同一颗星</h3>
+          <div class="calib-io">
+            <label class="file-btn">停跟踪前…<input id="calibWFileA" type="file" accept="image/*" hidden></label>
+            <label class="file-btn">停跟踪后…<input id="calibWFileB" type="file" accept="image/*" hidden></label>
+          </div>
+          <div class="calib-views">
+            <div class="calib-view" id="calibWViewA"><img alt="停跟踪前"><svg></svg><em>前</em></div>
+            <div class="calib-view" id="calibWViewB"><img alt="停跟踪后"><svg></svg><em>后 · 叠位移箭头</em></div>
+          </div>
+          <div class="calib-coords">
+            <span>或直接填像素坐标：</span>前 (
+            <input id="calibWX1" type="number" step="any" placeholder="x">,
+            <input id="calibWY1" type="number" step="any" placeholder="y"> ) 后 (
+            <input id="calibWX2" type="number" step="any" placeholder="x">,
+            <input id="calibWY2" type="number" step="any" placeholder="y"> )
+          </div>
+        </div>
+        <div class="calib-step">
+          <h3>步骤二 · 天球北向：赤纬轴微动，前后各拍一张，在两张图上点同一颗星</h3>
+          <div class="calib-io">
+            <label>微动方向
+              <select id="calibNudgeDir">
+                <option value="N">向北微动（星点在画面中应向南移）</option>
+                <option value="S">向南微动（星点在画面中应向北移）</option>
+              </select>
+            </label>
+            <label class="file-btn">微动前…<input id="calibNFileA" type="file" accept="image/*" hidden></label>
+            <label class="file-btn">微动后…<input id="calibNFileB" type="file" accept="image/*" hidden></label>
+          </div>
+          <div class="calib-views">
+            <div class="calib-view" id="calibNViewA"><img alt="微动前"><svg></svg><em>前</em></div>
+            <div class="calib-view" id="calibNViewB"><img alt="微动后"><svg></svg><em>后 · 叠位移箭头</em></div>
+          </div>
+          <div class="calib-coords">
+            <span>或直接填像素坐标：</span>前 (
+            <input id="calibNX1" type="number" step="any" placeholder="x">,
+            <input id="calibNY1" type="number" step="any" placeholder="y"> ) 后 (
+            <input id="calibNX2" type="number" step="any" placeholder="x">,
+            <input id="calibNY2" type="number" step="any" placeholder="y"> )
+          </div>
+          <div class="calib-coords">
+            <span>刻度读数（选填，用于实测刻度增大方向；取自同一视场的目镜/屏幕标尺）：</span>
+            微动前 <input id="calibTickBefore" type="number" step="any" placeholder="格">
+            微动后 <input id="calibTickAfter" type="number" step="any" placeholder="格">
+          </div>
+        </div>
+        <div class="calib-actions">
+          <button id="calibComputeBtn" type="button" class="big">计算标定预览</button>
+          <button id="calibApplyBtn" type="button" disabled>确认并应用到会话</button>
+          <button id="calibClearResultBtn" type="button" class="ghost danger" hidden>清除所选配置的旧结果</button>
+        </div>
+        <div id="calibErrors"></div>
+        <div id="calibPreview"></div>
+      </details>
+    </div>
     <div class="card">
       <h2>③ 漂移轨迹（赤纬方向，<span id="driftUnit">刻度</span>）</h2>
       <svg id="chart" viewBox="0 0 640 300" role="img" aria-label="漂移轨迹图"></svg>
