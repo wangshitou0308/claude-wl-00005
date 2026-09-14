@@ -833,7 +833,7 @@ function renderFov(analyses) {
   $("fovHint").textContent = calib
     ? `N/W 方向来自实测标定「${calib.profileName || "未命名"}」（旋转 ${calib.rotationDeg}°，` +
       `${calib.mirrored ? "有镜像" : "直接成像"}）；刻度增大端指向真实${sdEff === "N" ? "北" : "南"}` +
-      `${calib.scaleDir ? "（实测）" : "（手动设置）"}。`
+      `${calib.scaleDir ? scaleSourceText(calib) : "（手动设置）"}。`
     : `N 为真实北天方向，已按“${({none:"无翻转",diag:"天顶镜(上下翻转)",mirror:"反射(左右翻转)",rotate180:"旋转180°",custom:"自定义旋转"})[s.flip]}”映射；` +
       `刻度增大端你设定为指向真实${sdEff === "N" ? "北（赤纬增大）" : "南（赤纬减小）"}。停跟踪后恒星沿白虚线西移，可据此核对方向。`;
 }
@@ -1145,7 +1145,7 @@ function renderPrintSheet(res, analyses) {
     <table><tr><th>配置</th><th>旋转角</th><th>镜像</th><th>刻度增大端</th><th>西向位移</th><th>微动位移</th><th>向量夹角</th><th>微动方向</th><th>应用时间</th></tr><tr>
       <td>${escHtml(cal.profileName || "未命名")}</td><td>${cal.rotationDeg}°</td>
       <td>${cal.mirrored ? "有镜像" : "直接成像"}</td>
-      <td>${cal.scaleDir ? "真实" + (cal.scaleDir === "N" ? "北" : "南") + "（实测）" : "未实测（沿用手动）"}</td>
+      <td>${cal.scaleDir ? "真实" + (cal.scaleDir === "N" ? "北" : "南") + scaleSourceText(cal) : "未实测（沿用手动）"}</td>
       <td>${cal.westLenPx ?? "—"} px</td><td>${cal.northLenPx ?? "—"} px</td>
       <td>${cal.angleDeg ?? "—"}°</td>
       <td>${cal.nudgeDir === "S" ? "向南微动" : "向北微动"}</td>
@@ -1164,7 +1164,7 @@ function renderPrintSheet(res, analyses) {
         return `H=${(g.H * 180 / Math.PI).toFixed(1)}° δ=${(g.dec * 180 / Math.PI).toFixed(1)}°`;
       })()}</td>
       <td>${cal ? `实测 ${cal.rotationDeg}°${cal.mirrored ? "·镜像" : ""}` : ({none:"无",diag:"天顶镜",mirror:"反射",rotate180:"180°",custom:"自定义"})[s.flip]}</td>
-      <td>${sdEff === "N" ? "真实北" : "真实南"}${cal && cal.scaleDir ? "（实测）" : ""}</td><td>${s.arcsecPerTick ? s.arcsecPerTick + ' ″/格' : "未标定（仅方向）"}</td></tr></table>
+      <td>${sdEff === "N" ? "真实北" : "真实南"}${cal && cal.scaleDir ? scaleSourceText(cal) : ""}</td><td>${s.arcsecPerTick ? s.arcsecPerTick + ' ″/格' : "未标定（仅方向）"}</td></tr></table>
     ${calibSection}
     <h3>当前轮次各测段</h3>
     <table><tr><th>测段</th><th>点数</th><th>时长</th><th>斜率(格/分)</th><th>赤纬漂移(″/s)</th><th>警告/拒绝依据</th></tr>
@@ -1247,15 +1247,34 @@ const CalibMeasure = {
     // 手性：直接成像时 cross(N,W)>0（北在上则西在右）；反号说明有奇次反射
     const mirrored = (N.dx * W.dy - N.dy * W.dx) < 0;
 
-    // 刻度增大方向：微动使星点沿刻度移动，读数增减对照星点真实去向
-    let scaleDir = null;
+    // 刻度增大方向：刻度=像素读数时，增大方向取离天北最近的像素轴正向，
+    // 它在天空中的指向（N/S）由北向量直接判定——两条向量即可定出
+    const ax = Math.abs(N.dx), ay = Math.abs(N.dy);
+    let scaleAxis, scaleDir;
+    if (ax >= ay) {          // 南北线更接近水平：刻度轴 = x
+      scaleAxis = "x";
+      scaleDir = N.dx > 0 ? "N" : "S";
+    } else {                 // 更接近竖直：刻度轴 = y（+y 向画面下方）
+      scaleAxis = "y";
+      scaleDir = N.dy > 0 ? "N" : "S";
+    }
+    let scaleDirSource = "pixel_axis";
+    const axisDevDeg = Math.acos(Math.min(1, Math.max(ax, ay))) * 180 / Math.PI;
+    if (axisDevDeg > 30)
+      warnings.push(`天北方向与最近的像素轴相差 ${axisDevDeg.toFixed(0)}°：若按像素坐标读刻度，请沿南北线投影取值，或旋转相机使南北线贴近像素轴。`);
+
+    // 若另填了微动前后的刻度读数（目镜/标尺格值），以实测读数为准
     const tb = opts.tickBefore, ta = opts.tickAfter;
     if (tb !== null && tb !== undefined && ta !== null && ta !== undefined) {
       if (ta === tb) {
-        warnings.push("微动前后刻度读数相同，无法判定刻度增大方向，沿用会话手动设置。");
+        warnings.push("微动前后刻度读数相同，刻度增大方向按像素轴推定。");
       } else {
         const starSkyDir = nudge === "N" ? "S" : "N";   // 星点在天空中的实际去向
-        scaleDir = (ta > tb) ? starSkyDir : (starSkyDir === "S" ? "N" : "S");
+        const byTicks = (ta > tb) ? starSkyDir : (starSkyDir === "S" ? "N" : "S");
+        if (byTicks !== scaleDir)
+          warnings.push(`刻度读数推定（增大端→${byTicks === "N" ? "北" : "南"}）与像素轴推定（→${scaleDir === "N" ? "北" : "南"}）相反：读目镜/标尺格值时以读数为准；读像素坐标时请核对读数。`);
+        scaleDir = byTicks;
+        scaleDirSource = "ticks";
       }
     }
 
@@ -1263,7 +1282,7 @@ const CalibMeasure = {
       ok: true, errors, warnings,
       result: {
         rotationDeg: Math.round(rotationDeg * 10) / 10,
-        mirrored, scaleDir,
+        mirrored, scaleDir, scaleAxis, scaleDirSource,
         west: W, north: N,
         westLenPx: Math.round(lenW * 10) / 10,
         northLenPx: Math.round(lenN * 10) / 10,
@@ -1432,13 +1451,28 @@ function computeCalibPreview() {
       tickBefore: numOrNull($("calibTickBefore").value.trim()),
       tickAfter: numOrNull($("calibTickAfter").value.trim()),
     });
+    // 向量校验未过（位移太短/近乎平行/微动方向不明）：把拒绝原因带进错误区，
+    // 否则错误区空白、只剩应用按钮被禁用
+    if (res && !res.ok) errors.push(...res.errors);
   }
   state.calibPreview = res && res.ok ? res : null;
-  renderCalibOutcome(errors, res);
+  renderCalibOutcome(errors, res && res.ok ? res : null);
 }
 
 function rotToCompass(rot) {
   return ["正上方", "右上方", "正右方", "右下方", "正下方", "左下方", "正左方", "左上方"][Math.round(rot / 45) % 8];
+}
+
+// 刻度增大方向的来源说明：读数实测 / 像素轴推定 / 旧数据（实测）
+function scaleSourceText(c) {
+  if (!c || !c.scaleDir) return "";
+  if (c.scaleDirSource === "ticks") return "（读数实测）";
+  if (c.scaleDirSource === "pixel_axis") return "（像素轴推定）";
+  return "（实测）";
+}
+function scaleDirText(c) {
+  if (!c || !c.scaleDir) return "未实测，沿用手动设置";
+  return `指向真实${c.scaleDir === "N" ? "北" : "南"}${scaleSourceText(c)}`;
 }
 
 function renderCalibOutcome(errors, res, note) {
@@ -1458,7 +1492,7 @@ function renderCalibOutcome(errors, res, note) {
     `<div>` +
     `<p>旋转：天北在画面中指向 <b>${r.rotationDeg}°</b>（${rotToCompass(r.rotationDeg)}，自正上方顺时针）</p>` +
     `<p>镜像：<b>${r.mirrored ? "有镜像（奇次反射，如天顶镜）" : "无镜像（直接成像）"}</b></p>` +
-    `<p>刻度增大方向：<b>${r.scaleDir ? "指向真实" + (r.scaleDir === "N" ? "北" : "南") + "（实测）" : "未实测，沿用手动设置"}</b></p>` +
+    `<p>刻度增大方向：<b>${scaleDirText(r)}</b></p>` +
     `<p class="hint">西向位移 ${r.westLenPx} px · 微动位移 ${r.northLenPx} px · 两向量夹角 ${r.angleDeg}° · 微动方向：向${r.nudgeDir === "N" ? "北" : "南"}</p>` +
     (res.warnings || []).map((x) => `<div class="calib-warn">⚠ ${x}</div>`).join("") +
     (note ? `<div class="calib-ok">✓ ${note}</div>` : "") +
@@ -1539,7 +1573,7 @@ function renderCalibProfileInfo() {
   const r = p.result || {};
   info.textContent = r.west
     ? `已存结果：旋转 ${r.rotationDeg}°（天北在画面中），${r.mirrored ? "有镜像" : "直接成像"}，` +
-      `刻度增大端${r.scaleDir ? "→真实" + (r.scaleDir === "N" ? "北" : "南") + "（实测）" : "未实测"}，` +
+      `刻度增大端${r.scaleDir ? "→真实" + (r.scaleDir === "N" ? "北" : "南") + scaleSourceText(r) : "未实测"}，` +
       `西向位移 ${r.westLenPx} px，微动位移 ${r.northLenPx} px，夹角 ${r.angleDeg}°，` +
       `更新于 ${new Date(p.updated_at).toLocaleString()}。`
     : "该配置还没有标定结果：完成下面两步实测并“计算标定预览”后应用即可写入。";
@@ -1632,7 +1666,7 @@ function renderActiveCalibInfo() {
   }
   el.innerHTML = `已应用实测标定：<b>${escHtml(c.profileName || "未命名配置")}</b>` +
     `（旋转 ${c.rotationDeg}°，${c.mirrored ? "有镜像" : "直接成像"}` +
-    `${c.scaleDir ? `，刻度增大端→真实${c.scaleDir === "N" ? "北" : "南"}` : ""}）。` +
+    `${c.scaleDir ? `，刻度增大端→真实${c.scaleDir === "N" ? "北" : "南"}${scaleSourceText(c)}` : ""}）。` +
     `手动翻转${c.scaleDir ? "与刻度方向" : ""}设置已被覆盖。` +
     `<button type="button" id="calibDisableBtn" class="ghost">停用标定</button>`;
   $("calibDisableBtn").addEventListener("click", async () => {
@@ -1777,5 +1811,6 @@ if (typeof document !== "undefined") {
 
 // 供 node 环境做纯函数核对（浏览器里无 module）
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { Calc, CalibMeasure };
+  module.exports = { Calc, CalibMeasure, state, calibViews,
+    setupCalibViews, computeCalibPreview, renderCalibOutcome };
 }
